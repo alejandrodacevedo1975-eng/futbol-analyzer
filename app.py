@@ -2,68 +2,47 @@ import gradio as gr
 import math
 import random
 import os
-import requests
+import json
 from collections import Counter
+from google import genai
 
 HOME_ADVANTAGE_FACTOR = 1.15
-FD_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-COMPETITIONS = {
-    "Premier League": "PL",
-    "La Liga": "PD", 
-    "Bundesliga": "BL1",
-    "Serie A": "SA",
-    "Ligue 1": "FL1",
-    "Champions League": "CL",
-    "Eredivisie": "DED",
-}
-
-def get_team_id(team_name):
-    headers = {"X-Auth-Token": FD_KEY}
-    for comp_id in COMPETITIONS.values():
-        try:
-            r = requests.get(
-                f"https://api.football-data.org/v4/competitions/{comp_id}/teams",
-                headers=headers, timeout=10
-            )
-            teams = r.json().get("teams", [])
-            for t in teams:
-                if team_name.lower() in t["name"].lower() or team_name.lower() in t.get("shortName","").lower():
-                    return t["id"]
-        except:
-            continue
-    return None
-
-def get_team_stats(team_id):
-    headers = {"X-Auth-Token": FD_KEY}
+def get_team_stats_gemini(home_team, away_team):
     try:
-        r = requests.get(
-            f"https://api.football-data.org/v4/teams/{team_id}/matches",
-            headers=headers,
-            params={"status": "FINISHED", "limit": 10},
-            timeout=10
+        client = genai.Client(api_key=GEMINI_KEY)
+        prompt = f"""
+Busca en internet las estadísticas recientes de estos dos equipos de fútbol.
+Para cada equipo necesito los últimos 5 partidos y calcular:
+- Promedio de goles marcados por partido
+- Promedio de goles recibidos por partido
+
+Equipos: {home_team} (local) y {away_team} (visitante)
+
+Responde SOLO con este JSON exacto sin texto adicional ni markdown:
+{{
+  "home_avg_scored": 1.5,
+  "home_avg_conceded": 1.0,
+  "away_avg_scored": 1.2,
+  "away_avg_conceded": 1.3
+}}
+"""
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
         )
-        matches = r.json().get("matches", [])
-        if not matches:
-            return None, None
-        goals_for, goals_against = [], []
-        for m in matches:
-            home_id = m["homeTeam"]["id"]
-            gh = m["score"]["fullTime"]["home"]
-            ga = m["score"]["fullTime"]["away"]
-            if gh is None or ga is None:
-                continue
-            if home_id == team_id:
-                goals_for.append(gh)
-                goals_against.append(ga)
-            else:
-                goals_for.append(ga)
-                goals_against.append(gh)
-        if not goals_for:
-            return None, None
-        return round(sum(goals_for)/len(goals_for), 2), round(sum(goals_against)/len(goals_against), 2)
-    except:
-        return None, None
+        text = response.text.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        return (
+            float(data["home_avg_scored"]),
+            float(data["home_avg_conceded"]),
+            float(data["away_avg_scored"]),
+            float(data["away_avg_conceded"]),
+        )
+    except Exception as e:
+        return None, None, None, None
 
 def poisson_random(lam):
     L = math.exp(-max(lam, 0.1))
@@ -80,21 +59,14 @@ def analyze(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_
     if not home_team or not away_team:
         return "⚠️ Ingresa los nombres de los equipos."
 
-    home_id = get_team_id(home_team)
-    away_id = get_team_id(away_team)
+    home_avg, home_def, away_avg, away_def = get_team_stats_gemini(home_team, away_team)
 
-    if not home_id or not away_id:
-        return f"⚠️ No se encontró: {''+home_team if not home_id else away_team}. Intenta con el nombre en inglés."
-
-    home_avg, home_def = get_team_stats(home_id)
-    away_avg, away_def = get_team_stats(away_id)
-
-    if home_avg is None or away_avg is None:
-        return "⚠️ No se pudieron obtener estadísticas. Intenta de nuevo."
+    if home_avg is None:
+        return "⚠️ No se pudieron obtener datos. Intenta de nuevo."
 
     league_avg = 1.4
-    home_exp = max((home_avg/league_avg)*(away_def/league_avg)*league_avg*HOME_ADVANTAGE_FACTOR, 0.3)
-    away_exp = max((away_avg/league_avg)*(home_def/league_avg)*league_avg, 0.3)
+    home_exp = max((home_avg / league_avg) * (away_def / league_avg) * league_avg * HOME_ADVANTAGE_FACTOR, 0.3)
+    away_exp = max((away_avg / league_avg) * (home_def / league_avg) * league_avg, 0.3)
 
     results = monte_carlo(home_exp, away_exp)
     n = len(results)
@@ -136,7 +108,7 @@ def analyze(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_
 ⚽ {home_team} vs {away_team}
 {'='*40}
 
-📊 DATOS REALES (football-data.org)
+📊 DATOS (vía Gemini AI)
   {home_team}: {home_avg} goles/partido (permite {home_def})
   {away_team}: {away_avg} goles/partido (permite {away_def})
 
@@ -169,7 +141,7 @@ demo = gr.Interface(
     fn=analyze,
     inputs=[
         gr.Textbox(label="Equipo Local", placeholder="Ej: Barcelona"),
-        gr.Textbox(label="Equipo Visitante", placeholder="Ej: Arsenal"),
+        gr.Textbox(label="Equipo Visitante", placeholder="Ej: Real Madrid"),
         gr.Number(label="Cuota Victoria Local", value=2.10),
         gr.Number(label="Cuota Empate", value=3.40),
         gr.Number(label="Cuota Victoria Visitante", value=3.20),
@@ -178,7 +150,7 @@ demo = gr.Interface(
     ],
     outputs=gr.Textbox(label="Análisis Completo", lines=35),
     title="⚽ Analizador de Fútbol para Apuestas",
-    description="Escribe los equipos y las cuotas — los datos se obtienen automáticamente.",
+    description="Escribe los equipos y las cuotas — Gemini AI busca los datos automáticamente.",
 )
 
-demo.launch()
+demo.launch(server_name="0.0.0.0", server_port=10000)
