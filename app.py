@@ -2,14 +2,29 @@ import os
 import math
 import random
 import json
-import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import Counter
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 HOME_ADVANTAGE_FACTOR = 1.15
+
+# Servidor web falso para satisfacer a Render
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot activo")
+    def log_message(self, format, *args):
+        pass
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
 def get_team_stats(home_team, away_team):
     try:
@@ -18,8 +33,8 @@ def get_team_stats(home_team, away_team):
         client = genai.Client(api_key=GEMINI_KEY)
         prompt = f"""
 Busca en internet estadísticas reales de fútbol de {home_team} y {away_team}.
-Encuentra sus últimos 5-10 partidos y calcula promedio de goles marcados y recibidos.
-Responde SOLO con JSON sin markdown:
+Últimos 5-10 partidos. Calcula promedio goles marcados y recibidos.
+Responde SOLO JSON sin markdown:
 {{"home_avg_scored":1.5,"home_avg_conceded":1.0,"away_avg_scored":1.2,"away_avg_conceded":1.3}}
 """
         response = client.models.generate_content(
@@ -43,8 +58,8 @@ def poisson_random(lam):
         p *= random.random()
     return k - 1
 
-def analizar(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_btts):
-    home_avg, home_def, away_avg, away_def = get_team_stats(home_team, away_team)
+def analizar(home, away, odd_home, odd_draw, odd_away, odd_over25, odd_btts):
+    home_avg, home_def, away_avg, away_def = get_team_stats(home, away)
     if home_avg is None:
         return "⚠️ No se pudieron obtener datos. Intenta de nuevo."
 
@@ -66,10 +81,10 @@ def analizar(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd
 
     markets = {
         "Victoria Local": (p_home, odd_home),
-        "Empate":         (p_draw, odd_draw),
+        "Empate": (p_draw, odd_draw),
         "Victoria Visit": (p_away, odd_away),
-        "Over 2.5":       (p_o25,  odd_over25),
-        "BTTS Sí":        (p_btts, odd_btts),
+        "Over 2.5": (p_o25, odd_over25),
+        "BTTS Sí": (p_btts, odd_btts),
     }
     value_lines = []
     for market, (prob, odd) in markets.items():
@@ -80,71 +95,50 @@ def analizar(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd
 
     max_prob = max(p_home, p_draw, p_away)
     has_value = any("✅" in v for v in value_lines)
-    if max_prob >= 0.55 and has_value:
-        signal = "🟢 ALTA CONFIANZA"
-    elif max_prob >= 0.45:
-        signal = "🟡 CONFIANZA MEDIA"
-    else:
-        signal = "🔴 BAJA CONFIANZA"
+    signal = "🟢 ALTA CONFIANZA" if max_prob >= 0.55 and has_value else "🟡 CONFIANZA MEDIA" if max_prob >= 0.45 else "🔴 BAJA CONFIANZA"
 
-    return f"""
-⚽ *{home_team} vs {away_team}*
+    return f"""⚽ *{home} vs {away}*
 
-📊 *Datos automáticos*
-{home_team}: {home_avg} goles/p (permite {home_def})
-{away_team}: {away_avg} goles/p (permite {away_def})
+📊 *Datos reales*
+{home}: {home_avg} goles/p (permite {home_def})
+{away}: {away_avg} goles/p (permite {away_def})
 
-📈 *Goles esperados*
-Local: {home_exp:.2f} | Visit: {away_exp:.2f} | Total: {home_exp+away_exp:.2f}
-
-🎯 *Probabilidades 1X2*
-{home_team}: {p_home:.1%}
-Empate: {p_draw:.1%}
-{away_team}: {p_away:.1%}
+🎯 *1X2*
+{home}: {p_home:.1%} | Empate: {p_draw:.1%} | {away}: {p_away:.1%}
 
 ⚽ *Over/Under*
 Over 1.5: {p_o15:.1%} | Over 2.5: {p_o25:.1%} | Over 3.5: {p_o35:.1%}
 
-🔥 *BTTS*
-Sí: {p_btts:.1%} | No: {1-p_btts:.1%}
+🔥 *BTTS* Sí: {p_btts:.1%} | No: {1-p_btts:.1%}
 
-🏆 *Marcadores probables*
+🏆 *Marcadores*
 {"".join(f"{h}-{a}: {c/n:.1%}\n" for (h,a),c in top)}
-💰 *Valor de apuesta*
+💰 *Valor*
 {"".join(f"{v}\n" for v in value_lines)}
-🚦 *{signal}*
-"""
+🚦 *{signal}*"""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚽ *Analizador de Fútbol para Apuestas*\n\n"
-        "Envía el análisis así:\n"
-        "`/analizar Barcelona Real Madrid 2.10 3.40 3.20 1.85 1.75`\n\n"
-        "Orden: Local Visitante CuotaLocal CuotaEmpate CuotaVisit CuotaOver25 CuotaBTTS",
+        "⚽ *Analizador de Fútbol*\n\nUso:\n`/analizar Barcelona RealMadrid 2.10 3.40 3.20 1.85 1.75`",
         parse_mode="Markdown"
     )
 
 async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 7:
-        await update.message.reply_text(
-            "⚠️ Uso correcto:\n`/analizar Barcelona RealMadrid 2.10 3.40 3.20 1.85 1.75`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Uso:\n`/analizar Local Visitante CuotaL CuotaE CuotaV CuotaO25 CuotaBTTS`", parse_mode="Markdown")
         return
-    home = args[0]
-    away = args[1]
     try:
         odds = [float(x) for x in args[2:7]]
     except:
-        await update.message.reply_text("⚠️ Las cuotas deben ser números. Ej: 2.10")
+        await update.message.reply_text("⚠️ Las cuotas deben ser números.")
         return
-
-    await update.message.reply_text("🔍 Analizando... espera unos segundos.")
-    resultado = analizar(home, away, *odds)
+    await update.message.reply_text("🔍 Analizando...")
+    resultado = analizar(args[0], args[1], *odds)
     await update.message.reply_text(resultado, parse_mode="Markdown")
 
 if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analizar", analizar_cmd))
