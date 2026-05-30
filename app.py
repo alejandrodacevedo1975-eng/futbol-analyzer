@@ -1,47 +1,38 @@
-import gradio as gr
+import os
 import math
 import random
-import os
 import json
+import requests
 from collections import Counter
-from google import genai
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-HOME_ADVANTAGE_FACTOR = 1.15
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+HOME_ADVANTAGE_FACTOR = 1.15
 
-def get_team_stats_gemini(home_team, away_team):
+def get_team_stats(home_team, away_team):
     try:
+        from google import genai
+        from google.genai import types
         client = genai.Client(api_key=GEMINI_KEY)
         prompt = f"""
-Busca en internet las estadísticas recientes de estos dos equipos de fútbol.
-Para cada equipo necesito los últimos 5 partidos y calcular:
-- Promedio de goles marcados por partido
-- Promedio de goles recibidos por partido
-
-Equipos: {home_team} (local) y {away_team} (visitante)
-
-Responde SOLO con este JSON exacto sin texto adicional ni markdown:
-{{
-  "home_avg_scored": 1.5,
-  "home_avg_conceded": 1.0,
-  "away_avg_scored": 1.2,
-  "away_avg_conceded": 1.3
-}}
+Busca en internet estadísticas reales de fútbol de {home_team} y {away_team}.
+Encuentra sus últimos 5-10 partidos y calcula promedio de goles marcados y recibidos.
+Responde SOLO con JSON sin markdown:
+{{"home_avg_scored":1.5,"home_avg_conceded":1.0,"away_avg_scored":1.2,"away_avg_conceded":1.3}}
 """
         response = client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=prompt
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
         )
-        text = response.text.strip()
-        text = text.replace("```json", "").replace("```", "").strip()
+        text = response.text.strip().replace("```json","").replace("```","").strip()
         data = json.loads(text)
-        return (
-            float(data["home_avg_scored"]),
-            float(data["home_avg_conceded"]),
-            float(data["away_avg_scored"]),
-            float(data["away_avg_conceded"]),
-        )
-    except Exception as e:
+        return float(data["home_avg_scored"]), float(data["home_avg_conceded"]), float(data["away_avg_scored"]), float(data["away_avg_conceded"])
+    except:
         return None, None, None, None
 
 def poisson_random(lam):
@@ -52,23 +43,16 @@ def poisson_random(lam):
         p *= random.random()
     return k - 1
 
-def monte_carlo(home_exp, away_exp, iterations=10000):
-    return [(poisson_random(home_exp), poisson_random(away_exp)) for _ in range(iterations)]
-
-def analyze(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_btts):
-    if not home_team or not away_team:
-        return "⚠️ Ingresa los nombres de los equipos."
-
-    home_avg, home_def, away_avg, away_def = get_team_stats_gemini(home_team, away_team)
-
+def analizar(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_btts):
+    home_avg, home_def, away_avg, away_def = get_team_stats(home_team, away_team)
     if home_avg is None:
         return "⚠️ No se pudieron obtener datos. Intenta de nuevo."
 
     league_avg = 1.4
-    home_exp = max((home_avg / league_avg) * (away_def / league_avg) * league_avg * HOME_ADVANTAGE_FACTOR, 0.3)
-    away_exp = max((away_avg / league_avg) * (home_def / league_avg) * league_avg, 0.3)
+    home_exp = max((home_avg/league_avg)*(away_def/league_avg)*league_avg*HOME_ADVANTAGE_FACTOR, 0.3)
+    away_exp = max((away_avg/league_avg)*(home_def/league_avg)*league_avg, 0.3)
 
-    results = monte_carlo(home_exp, away_exp)
+    results = [(poisson_random(home_exp), poisson_random(away_exp)) for _ in range(10000)]
     n = len(results)
 
     p_home = sum(1 for h,a in results if h > a) / n
@@ -78,7 +62,6 @@ def analyze(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_
     p_o25  = sum(1 for h,a in results if h+a > 2.5) / n
     p_o35  = sum(1 for h,a in results if h+a > 3.5) / n
     p_btts = sum(1 for h,a in results if h > 0 and a > 0) / n
-
     top = Counter(results).most_common(5)
 
     markets = {
@@ -105,52 +88,64 @@ def analyze(home_team, away_team, odd_home, odd_draw, odd_away, odd_over25, odd_
         signal = "🔴 BAJA CONFIANZA"
 
     return f"""
-⚽ {home_team} vs {away_team}
-{'='*40}
+⚽ *{home_team} vs {away_team}*
 
-📊 DATOS (vía Gemini AI)
-  {home_team}: {home_avg} goles/partido (permite {home_def})
-  {away_team}: {away_avg} goles/partido (permite {away_def})
+📊 *Datos automáticos*
+{home_team}: {home_avg} goles/p (permite {home_def})
+{away_team}: {away_avg} goles/p (permite {away_def})
 
-📈 GOLES ESPERADOS
-  Local:     {home_exp:.2f}
-  Visitante: {away_exp:.2f}
-  Total:     {home_exp+away_exp:.2f}
+📈 *Goles esperados*
+Local: {home_exp:.2f} | Visit: {away_exp:.2f} | Total: {home_exp+away_exp:.2f}
 
-🎯 PROBABILIDADES 1X2
-  {home_team}: {p_home:.1%}
-  Empate:      {p_draw:.1%}
-  {away_team}: {p_away:.1%}
+🎯 *Probabilidades 1X2*
+{home_team}: {p_home:.1%}
+Empate: {p_draw:.1%}
+{away_team}: {p_away:.1%}
 
-⚽ OVER/UNDER
-  Over 1.5: {p_o15:.1%}
-  Over 2.5: {p_o25:.1%}
-  Over 3.5: {p_o35:.1%}
+⚽ *Over/Under*
+Over 1.5: {p_o15:.1%} | Over 2.5: {p_o25:.1%} | Over 3.5: {p_o35:.1%}
 
-🔥 BTTS (Ambos anotan)
-  Sí: {p_btts:.1%} | No: {1-p_btts:.1%}
+🔥 *BTTS*
+Sí: {p_btts:.1%} | No: {1-p_btts:.1%}
 
-🏆 MARCADORES MÁS PROBABLES
-{"".join(f"  {h}-{a}: {c/n:.1%}\n" for (h,a),c in top)}
-💰 ANÁLISIS DE VALOR
-{"".join(f"  {v}\n" for v in value_lines)}
-🚦 {signal}
+🏆 *Marcadores probables*
+{"".join(f"{h}-{a}: {c/n:.1%}\n" for (h,a),c in top)}
+💰 *Valor de apuesta*
+{"".join(f"{v}\n" for v in value_lines)}
+🚦 *{signal}*
 """
 
-demo = gr.Interface(
-    fn=analyze,
-    inputs=[
-        gr.Textbox(label="Equipo Local", placeholder="Ej: Barcelona"),
-        gr.Textbox(label="Equipo Visitante", placeholder="Ej: Real Madrid"),
-        gr.Number(label="Cuota Victoria Local", value=2.10),
-        gr.Number(label="Cuota Empate", value=3.40),
-        gr.Number(label="Cuota Victoria Visitante", value=3.20),
-        gr.Number(label="Cuota Over 2.5", value=1.85),
-        gr.Number(label="Cuota BTTS Sí", value=1.75),
-    ],
-    outputs=gr.Textbox(label="Análisis Completo", lines=35),
-    title="⚽ Analizador de Fútbol para Apuestas",
-    description="Escribe los equipos y las cuotas — Gemini AI busca los datos automáticamente.",
-)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚽ *Analizador de Fútbol para Apuestas*\n\n"
+        "Envía el análisis así:\n"
+        "`/analizar Barcelona Real Madrid 2.10 3.40 3.20 1.85 1.75`\n\n"
+        "Orden: Local Visitante CuotaLocal CuotaEmpate CuotaVisit CuotaOver25 CuotaBTTS",
+        parse_mode="Markdown"
+    )
 
-demo.launch(server_name="0.0.0.0", server_port=10000)
+async def analizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 7:
+        await update.message.reply_text(
+            "⚠️ Uso correcto:\n`/analizar Barcelona RealMadrid 2.10 3.40 3.20 1.85 1.75`",
+            parse_mode="Markdown"
+        )
+        return
+    home = args[0]
+    away = args[1]
+    try:
+        odds = [float(x) for x in args[2:7]]
+    except:
+        await update.message.reply_text("⚠️ Las cuotas deben ser números. Ej: 2.10")
+        return
+
+    await update.message.reply_text("🔍 Analizando... espera unos segundos.")
+    resultado = analizar(home, away, *odds)
+    await update.message.reply_text(resultado, parse_mode="Markdown")
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("analizar", analizar_cmd))
+    app.run_polling()
